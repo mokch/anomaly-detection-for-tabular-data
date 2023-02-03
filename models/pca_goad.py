@@ -9,6 +9,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from scipy import io
 import os
+from sklearn.decomposition import PCA
+import random
 
 class GOAD_loss(torch.nn.Module):
     def __init__(self, alpha = 0.1, margin = 1, device = 'cuda'):
@@ -41,8 +43,8 @@ def weights_init(m):
     elif classname.find('Emb') != -1:
         init.normal(m.weight, mean=0, std=0.01)
 
-class ODDStransLoader(object):
-    def __init__(self, data_path, data_name, trans_matrix, mode="train", seed=2023, test_size=0.5):
+class ODDSpcaLoader(object):
+    def __init__(self, data_path, data_name, pca_list, mode="train", seed=2023, test_size=0.5):
         # super().__len__(self)
         self.mode = mode
         self.name = data_name
@@ -71,10 +73,11 @@ class ODDStransLoader(object):
         print("train:", self.train.shape)
         print("valid:", self.valid.shape)
 
-        self.train = np.stack([self.train.dot(rot) for rot in trans_matrix], 2) # shape: [n_samples, trans_dim, n_trans]
-        self.valid = np.stack([self.valid.dot(rot) for rot in trans_matrix], 2) 
-        self.test = np.stack([self.test.dot(rot) for rot in trans_matrix], 2)
-        classification_labels = np.arange(trans_matrix.shape[0])
+        self.train = np.stack([pca.transform(self.train) for pca in pca_list], 2) # shape: [n_samples, trans_dim, n_trans]
+        self.valid = np.stack([pca.transform(self.valid) for pca in pca_list], 2)
+        self.test = np.stack([pca.transform(self.test) for pca in pca_list], 2)
+
+        classification_labels = np.arange(len(pca_list))
         self.train_labels = classification_labels.repeat(self.train.shape[0], 0).reshape(self.train.shape[0],-1)
         self.valid_labels = classification_labels.repeat(self.valid.shape[0], 0).reshape(self.valid.shape[0],-1)
 
@@ -102,9 +105,9 @@ class ODDStransLoader(object):
         else:
             return self.test.shape[0]
 
-def get_loader(data_path, batch_size, trans_matrix, dataset='tabular', data_name='thyroid', mode='train'):
+def get_loader(data_path, batch_size, pca_list, dataset='tabular', data_name='thyroid', mode='train'):
 
-    dataset = ODDStransLoader(data_path, data_name, trans_matrix, mode)
+    dataset = ODDSpcaLoader(data_path, data_name, pca_list, mode)
 
     if mode == 'train':
         shuffle = True
@@ -119,42 +122,53 @@ def get_loader(data_path, batch_size, trans_matrix, dataset='tabular', data_name
 
 
 
-class GOAD(object):
+class PCA_GOAD(object):
     def __init__(self, config):
-        super(GOAD, self).__init__()
-
-        if config.data_name == 'kdd':
-            self.n_rots, self.n_epoch, self.d_out, self.ndf = (64, 100, 64, 32)
-            self.model = GOAD_netC5(self.d_out, self.ndf, self.n_rots)
-
-        elif config.data_name == 'kddrev':
-            self.n_rots, self.n_epoch, self.d_out, self.ndf = (256, 100, 128, 128)
-            self.model = GOAD_netC5(self.d_out, self.ndf, self.n_rots)
-
-        elif config.data_name == "thyroid" or config.data_name == "arrhythmia":
-            self.n_rots, self.n_epoch, self.d_out, self.ndf = (256, 100, 32, 8)
-            self.model = GOAD_netC1(self.d_out, self.ndf, self.n_rots)
-
-        else:
-            self.n_rots, self.n_epoch, self.d_out, self.ndf = (256, 100, 128, 128)
-            self.model = GOAD_netC5(self.d_out, self.ndf, self.n_rots)
-
-        weights_init(self.model)
-        self.optimizerC = optim.Adam(self.model.parameters(), lr=config.lr, betas=(0.5, 0.999))
+        super(PCA_GOAD, self).__init__()
         self.data_path = config.data_path
         self.batch_size = config.batch_size
         self.data_name = config.data_name
         self.dataset = config.dataset
+        dataset = ODDSLoader(self.data_path, self.data_name, mode='train')
+        self.n_features = dataset.get_size()
+        self.d_out = self.n_features//2
+
+        if config.data_name == 'kdd':
+            self.n_rots, self.n_epoch, self.ndf = (64, 1000, 32)
+            self.model = GOAD_netC5(self.d_out, self.ndf, self.n_rots)
+
+        elif config.data_name == 'kddrev':
+            self.n_rots, self.n_epoch, self.ndf = (256, 1000, 128)
+            self.model = GOAD_netC5(self.d_out, self.ndf, self.n_rots)
+
+        elif config.data_name == "thyroid" or config.data_name == "arrhythmia":
+            self.n_rots, self.n_epoch, self.ndf = (256, 1000, 8)
+            self.model = GOAD_netC1(self.d_out, self.ndf, self.n_rots)
+
+        else:
+            self.n_rots, self.n_epoch, self.ndf = (256, 1000, 128)
+            self.model = GOAD_netC5(self.d_out, self.ndf, self.n_rots)
+
+        weights_init(self.model)
+        self.optimizerC = optim.Adam(self.model.parameters(), lr=config.lr, betas=(0.5, 0.999))
+        
+
 
 
     def prepare_data(self):
+
         dataset = ODDSLoader(self.data_path, self.data_name, mode='train')
-        n_features = dataset.get_size()
-        self.trans_matrix = np.random.randn(self.n_rots, n_features, self.d_out)
-        train_loader = get_loader(self.data_path, self.batch_size, self.trans_matrix, self.dataset, self.data_name, mode='train')
-        valid_loader = get_loader(self.data_path, self.batch_size, self.trans_matrix, self.dataset, self.data_name, mode='valid')
-        test_loader = get_loader(self.data_path, self.batch_size, self.trans_matrix, self.dataset, self.data_name, mode='test')
-        return train_loader, valid_loader, test_loader, self.trans_matrix
+        self.pca_list = []
+        for i in range(self.n_rots):
+            pca = PCA(n_components=self.n_features//2)
+            # idx = random.sample(list(np.arange(n_train)), n_train//args.n_rots)
+            idx = random.sample(list(np.arange(dataset.train.shape[0])), 100)
+            self.pca_list.append(pca.fit(dataset.train[idx]))
+
+        train_loader = get_loader(self.data_path, self.batch_size, self.pca_list, self.dataset, self.data_name, mode='train')
+        valid_loader = get_loader(self.data_path, self.batch_size, self.pca_list, self.dataset, self.data_name, mode='valid')
+        test_loader = get_loader(self.data_path, self.batch_size, self.pca_list, self.dataset, self.data_name, mode='test')
+        return train_loader, valid_loader, test_loader, self.pca_list
 
     def build_model(self):
         return self.model
